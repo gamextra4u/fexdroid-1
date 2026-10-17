@@ -7,11 +7,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/config.sh
 scripts/ensure-binfmt.sh >/dev/null
-FILES="/data/data/$FXD_PACKAGE/files"
+FILES="$(dirname "$FXD_ROOT")"   # x86_64 guest rootfs sits next to $FXD_ROOT
 STAGE="$PWD/build/payload-stage"
 CMD="${1:-uname -a; ls /; echo; ls \$FXD_ROOT}"
 docker run --rm --platform linux/arm64 --user "$(id -u):$(id -g)" \
-  -v "$STAGE/arm64:$FILES/rootfs" -v "$STAGE/x86_64:$FILES/x86_64:ro" \
+  -v "$STAGE/arm64:$FXD_ROOT" -v "$STAGE/x86_64:$FILES/x86_64:ro" \
   -e PATH="$FXD_ROOT/usr/bin:$FXD_ROOT/bin" -e HOME="$FXD_ROOT/home" -e LANG=C.UTF-8 \
   -e TMPDIR="$FXD_ROOT/tmp" -e FXD_ROOT="$FXD_ROOT" -e FEX_ROOTFS="$FILES/x86_64" \
   -e FEX_APP_CONFIG_LOCATION="$FXD_ROOT/home/.fex-emu/" -e FEX_APP_DATA_LOCATION="$FXD_ROOT/home/.fex-emu/" \

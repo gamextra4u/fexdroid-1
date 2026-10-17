@@ -1,0 +1,169 @@
+# Termux build: the same Linux payload as full-apk.yml (Debian arm64 rootfs, patched glibc,
+# FEX with thunks, x86_64 guest rootfs), rebuilt for a different on-device path and
+# published as tarballs instead of an APK. No Mesa/Turnip, no Android SDK/NDK, no Gradle.
+#
+# The rootfs path is baked into glibc and every ELF interpreter, so the tarball only works
+# when extracted at exactly FEXROOT_PATH. Default: Termux's files dir + /fexroot.
+# Needs the repo changes in fexroot-path.patch (FEXROOT_PATH in scripts/config.sh,
+# WITH_MESA / WITH_APK_PARTS in scripts/build-payload.sh).
+name: Termux rootfs (FEX + patched glibc)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fexroot_path:
+        description: "On-device rootfs path (absolute; baked into the binaries)"
+        default: /data/data/com.termux/files/fexroot
+      publish:
+        description: "Publish a release (termux-rootfs)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termux-rootfs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  termux-rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      FEXROOT_PATH: ${{ inputs.fexroot_path || '/data/data/com.termux/files/fexroot' }}
+      WITH_MESA: "0"
+      WITH_APK_PARTS: "0"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/lib/android
+          df -h /
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # clang/lld 22 + libclang for thunkgen, same as full-apk.yml. No meson/mako/glslang (Mesa only).
+      - name: Host packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build patchelf ccache zstd libarchive-tools \
+            bison flex file gcc-multilib >/dev/null
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 22 >/dev/null
+          sudo apt-get install -y -qq libclang-cpp22-dev libclang-22-dev llvm-22-dev lld-22 >/dev/null
+          for f in /usr/lib/llvm-22/bin/*; do sudo ln -sf "$f" /usr/local/bin/$(basename "$f"); done
+          clang --version | head -1
+
+      - name: Check the path
+        run: |
+          case "$FEXROOT_PATH" in /*) ;; *) echo "FEXROOT_PATH must be absolute"; exit 1;; esac
+          echo "rootfs path baked into the build: $FEXROOT_PATH"
+          bash -c 'source scripts/config.sh && echo "FXD_ROOT=$FXD_ROOT" && echo "FXD_LDSO=$FXD_LDSO"'
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-termux-${{ github.sha }}
+          restore-keys: ccache-termux-
+
+      # Every stage depends on the path (it is compiled in), so it is part of each key.
+      - name: Cache rootfs + sysroots
+        id: c-rootfs
+        uses: actions/cache@v4
+        with:
+          path: build/rootfs
+          key: rootfs-v1-${{ hashFiles('scripts/build-rootfs.sh', 'scripts/build-x86-sysroot.sh') }}
+      - name: Cache glibc
+        id: c-glibc
+        uses: actions/cache@v4
+        with:
+          path: build/glibc/install
+          key: glibc-${{ env.FEXROOT_PATH }}-${{ hashFiles('scripts/build-glibc.sh', 'scripts/config.sh', 'patches/glibc/**', 'scripts/lib/make-glibc*', 'scripts/lib/gen-android-seccomp.py', 'third_party/aosp-bionic-seccomp/**', 'tools/fxshmd/*.h') }}
+      - name: Cache FEX
+        id: c-fex
+        uses: actions/cache@v4
+        with:
+          path: build/fex/install
+          key: fex-${{ env.FEXROOT_PATH }}-${{ hashFiles('scripts/build-fex.sh', 'scripts/config.sh', 'patches/fex/**', 'scripts/cmake/**', 'scripts/lib/make-fex*', 'scripts/lib/gen-android-seccomp.py', 'third_party/aosp-bionic-seccomp/**', 'scripts/build-rootfs.sh', 'scripts/build-x86-sysroot.sh') }}
+
+      # build-rootfs.sh output does not depend on the path, but build-glibc/fex read
+      # build/rootfs (sysroots) and build-payload needs the tars, so build it when missing.
+      - name: Build rootfs + sysroots
+        if: steps.c-rootfs.outputs.cache-hit != 'true'
+        run: scripts/build-rootfs.sh && scripts/build-x86-sysroot.sh
+      - name: Build glibc
+        if: steps.c-glibc.outputs.cache-hit != 'true'
+        run: scripts/build-glibc.sh 2>&1 | tail -40
+      - name: Build FEX
+        if: steps.c-fex.outputs.cache-hit != 'true'
+        run: scripts/build-fex.sh 2>&1 | tail -40
+
+      - name: Assemble payload (no Mesa, no APK parts)
+        run: |
+          scripts/build-payload.sh 2>&1 | tail -40
+          ls -la build/payload/assets
+
+      - name: Payload self-tests (qemu, at the real path)
+        continue-on-error: true
+        run: |
+          source scripts/config.sh
+          scripts/test-payload-qemu.sh "$FXD_ROOT/opt/fexdroid-tests/seccomp-wrap" || true
+          scripts/test-payload-qemu.sh "$FXD_ROOT/opt/fexdroid-tests/shmtest all" || true
+          scripts/test-payload-qemu.sh "$FXD_ROOT/usr/bin/FEX --version" || true
+
+      - name: Package
+        run: |
+          mkdir -p out
+          source scripts/config.sh
+          for n in arm64 x86_64; do
+            zstd -T0 -10 -q -f build/payload/assets/rootfs-$n.tar -o out/rootfs-$n.tar.zst
+          done
+          cp build/rootfs/rootfs-arm64.packages.txt out/
+          cat > out/INSTALL.txt <<EOF
+          Built for the rootfs path: $FXD_ROOT
+          (baked into glibc and every ELF interpreter: extract it exactly there)
+
+          In Termux:
+            pkg install zstd tar
+            ROOT=$FXD_ROOT
+            mkdir -p "\$ROOT" "$(dirname "$FXD_ROOT")/x86_64"
+            zstd -dc rootfs-arm64.tar.zst  | tar -xf - -C "\$ROOT" --no-same-owner
+            zstd -dc rootfs-x86_64.tar.zst | tar -xf - -C "$(dirname "$FXD_ROOT")/x86_64" --no-same-owner
+
+          Run (the ELF interpreter is already set, no loader prefix needed):
+            export FXD_ROOT=$FXD_ROOT
+            export HOME=\$FXD_ROOT/home TMPDIR=\$FXD_ROOT/tmp LANG=C.UTF-8
+            export PATH=\$FXD_ROOT/usr/bin:\$FXD_ROOT/bin
+            export FEX_ROOTFS=$(dirname "$FXD_ROOT")/x86_64
+            export FEX_APP_CONFIG_LOCATION=\$HOME/.fex-emu/ FEX_APP_DATA_LOCATION=\$HOME/.fex-emu/
+            \$FXD_ROOT/usr/bin/FEX /usr/bin/uname -a
+          EOF
+          ( cd out && sha256sum rootfs-*.tar.zst > SHA256SUMS )
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux-rootfs
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish release (termux-rootfs)
+        if: ${{ inputs.publish != false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view termux-rootfs >/dev/null 2>&1 || \
+            gh release create termux-rootfs --target "$GITHUB_SHA" --prerelease \
+              --title "FEX + patched glibc rootfs for Termux" --notes "see INSTALL.txt"
+          gh release upload termux-rootfs --clobber out/*
+          {
+            echo "Built from \`${GITHUB_SHA:0:7}\` on $(date -u +%Y-%m-%d) for the path \`$FEXROOT_PATH\`."
+            echo
+            echo "The path is compiled in: extract the tarballs exactly there. See **INSTALL.txt**."
+          } > release-notes.md
+          gh release edit termux-rootfs --notes-file release-notes.md

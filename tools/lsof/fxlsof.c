@@ -20,6 +20,11 @@
 
 #define MAX_HITS 256
 
+// Used when FXD_ROOT is unset; build-payload.sh passes the build's root with -D.
+#ifndef FXD_DEFAULT_ROOT
+#define FXD_DEFAULT_ROOT "/data/data/ro.cobrabm.fexdroid/files/rootfs"
+#endif
+
 struct hit {
   int pid;
   char name[200];
@@ -27,7 +32,7 @@ struct hit {
 
 static const char* registry_dir(char* buf, size_t len) {
   const char* root = getenv("FXD_ROOT");
-  snprintf(buf, len, "%s/usr/share/fex-emu/fexdroid-tcp", root && *root ? root : "/data/data/ro.cobrabm.fexdroid/files/rootfs");
+  snprintf(buf, len, "%s/usr/share/fex-emu/fexdroid-tcp", root && *root ? root : FXD_DEFAULT_ROOT);
   return buf;
 }
 

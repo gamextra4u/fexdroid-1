@@ -21,8 +21,11 @@ need "build/glibc/install$FXD_LDSO" "scripts/build-glibc.sh"
 need "build/fex/install$FXD_ROOT/usr/bin/FEX" "scripts/build-fex.sh"
 
 # ---- bionic helper executables -------------------------------------------------
-CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
-"$CC" -O2 -Wall -fPIE -pie -o "$OUT/jniLibs/arm64-v8a/libfxprobe.so" tools/fxprobe/fxprobe.c
+# WITH_APK_PARTS=0 (Termux/plain rootfs builds): no NDK, no libfxprobe.so (app-only).
+if [[ "${WITH_APK_PARTS:-1}" == 1 ]]; then
+  CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
+  "$CC" -O2 -Wall -fPIE -pie -o "$OUT/jniLibs/arm64-v8a/libfxprobe.so" tools/fxprobe/fxprobe.c
+fi
 
 # ---- arm64 rootfs ------------------------------------------------------------------
 A="$STAGE/arm64"
@@ -38,8 +41,11 @@ done
 # FEX.
 cp -a "build/fex/install$FXD_ROOT/." "$A/"
 # Mesa Turnip (KGSL) + ICD manifest with the absolute on-device library path.
-need "build/mesa/install$FXD_ROOT/usr/lib/$FXD_MULTIARCH/libvulkan_freedreno.so" "scripts/build-mesa.sh"
-cp -a "build/mesa/install$FXD_ROOT/." "$A/"
+# WITH_MESA=0: skip Turnip; Debian's lavapipe (CPU Vulkan) stays as the only ICD.
+if [[ "${WITH_MESA:-1}" == 1 ]]; then
+  need "build/mesa/install$FXD_ROOT/usr/lib/$FXD_MULTIARCH/libvulkan_freedreno.so" "scripts/build-mesa.sh"
+  cp -a "build/mesa/install$FXD_ROOT/." "$A/"
+fi
 # Drop debug info from what we compiled ourselves (glibc, FEX); keeps dynamic symbols.
 find "$A/usr/lib/$FXD_MULTIARCH" -maxdepth 1 -newer build/rootfs/rootfs-arm64.tar -type f -name '*.so*' \
   -exec llvm-strip --strip-debug {} +
@@ -136,10 +142,10 @@ gcc -O2 -o "$X/opt/fexdroid-tests/tone" tests/common/tone.c -lm
 # SysV semaphores from an x86-64 guest: FEX semget/semop/semtimedop -> glibc -> fxshmd (N-025).
 # lsof for Steam's websocket peer check, answered from FEX's TCP records (tools/lsof/fxlsof.c).
 # The app copies it into the Steam rootfs (LinuxEnv.writeIdentityFiles).
-gcc -O2 -Wall -o "$X/usr/bin/lsof" tools/lsof/fxlsof.c
+gcc -O2 -Wall -DFXD_DEFAULT_ROOT="\"$FXD_ROOT\"" -o "$X/usr/bin/lsof" tools/lsof/fxlsof.c
 # The same for native arm64 programs (Valve's arm64 Steam client), whose sockets libfxpath records.
 clang --target=aarch64-linux-gnu --sysroot=build/rootfs/sysroot-arm64 -fuse-ld=lld \
-  -Wl,--dynamic-linker="$FXD_LDSO" -O2 -Wall -o "$A/usr/bin/lsof" tools/lsof/fxlsof.c
+  -Wl,--dynamic-linker="$FXD_LDSO" -O2 -Wall -DFXD_DEFAULT_ROOT="\"$FXD_ROOT\"" -o "$A/usr/bin/lsof" tools/lsof/fxlsof.c
 # Dynamic: static x86 binaries crash under FEX on older kernels (NOTES N-021).
 gcc -O2 -o "$X/opt/fexdroid-tests/semtest" tests/sysvsem/semtest.c
 # i386 variant (direct semget/semctl/semtimedop_time64 syscalls, FEX's x32 handlers); needs a
@@ -154,4 +160,4 @@ for n in arm64 x86_64; do
 done
 ( cd "$OUT/assets" && sha256sum rootfs-*.tar | sha256sum | cut -c1-16 ) > "$OUT/assets/payload.version"
 echo "{\"root\":\"$FXD_ROOT\",\"ldso\":\"$FXD_LDSO\"}" > "$OUT/assets/payload.json"
-ls -la "$OUT/assets" "$OUT/jniLibs/arm64-v8a"
+ls -la "$OUT/assets" "$OUT/jniLibs/arm64-v8a" 2>/dev/null || ls -la "$OUT/assets"
